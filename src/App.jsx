@@ -34,91 +34,31 @@ import {
   WifiOff,
   Users,
   ShieldCheck,
+  ShieldAlert,
+  ScrollText,
+  Crosshair,
+  Target,
 } from "lucide-react";
+import {
+  NAVY_DEEP,
+  NAVY_MID,
+  HEADER_BLUE,
+  AMBER,
+  getTheme,
+  SEV_STYLE,
+  FONT_SANS,
+  FONT_MONO,
+  timeLabel,
+  initials,
+  apiRequest,
+  SeverityBadge,
+  StatusSelect,
+  severityForLevel,
+} from "./shared.jsx";
+import AlertsView from "./views/AlertsView.jsx";
+import EventsView from "./views/EventsView.jsx";
+import AlertDetail from "./views/AlertDetail.jsx";
 
-/* ---------------------------------- tokens --------------------------------- */
-
-const NAVY_DEEP = "#071B3F";
-const NAVY_MID = "#123B7D";
-const HEADER_BLUE = "#2F6FE4";
-const AMBER = "#FFC63D";
-
-function getTheme(mode) {
-  if (mode === "dark") {
-    return {
-      bg: "#0B1220",
-      panel: "#121B2E",
-      border: "rgba(255,255,255,0.08)",
-      ink: "#F3F6FC",
-      slate: "#8B95A9",
-      blueBright: "#5B8DFF",
-      crimson: "#FF5F72",
-      orange: "#FFA05C",
-      green: "#3EE0A0",
-    };
-  }
-  return {
-    bg: "#F3F6FC",
-    panel: "#FFFFFF",
-    border: "#E3E9F3",
-    ink: "#0E1F3D",
-    slate: "#5B6B84",
-    blueBright: "#2F6FE4",
-    crimson: "#F1495B",
-    orange: "#FF8A3D",
-    green: "#2FBF87",
-  };
-}
-
-const SEV_STYLE = {
-  Critical: { bg: "#FDEBEC", text: "#D6273A", dot: "#F1495B" },
-  High: { bg: "#FFF1E5", text: "#C2600F", dot: "#FF8A3D" },
-  Medium: { bg: "#FFF8E1", text: "#9A7B0A", dot: "#FFC63D" },
-  Low: { bg: "#EAF7F1", text: "#1F8F63", dot: "#2FBF87" },
-};
-
-const STATUS_STYLE = {
-  Open: { bg: "#FDEBEC", text: "#D6273A" },
-  Investigating: { bg: "#FFF1E5", text: "#C2600F" },
-  Resolved: { bg: "#EAF7F1", text: "#1F8F63" },
-};
-
-const FONT_SANS =
-  "'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif";
-const FONT_MONO =
-  "'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
-
-/* --------------------------------- helpers --------------------------------- */
-
-function timeLabel(d) {
-  return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-}
-
-function initials(name) {
-  if (!name) return "U";
-  return name.trim().split(/\s+/).map((w) => w[0]).slice(0, 2).join("").toUpperCase();
-}
-
-// The dashboard is served by the backend itself, so every call is same-origin
-// (in development Vite proxies /api and /ws to the backend).
-async function apiRequest(path, { method = "GET", token, body } = {}) {
-  const res = await fetch(path, {
-    method,
-    headers: {
-      ...(body ? { "Content-Type": "application/json" } : {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const err = new Error(data.error || `Request failed (${res.status})`);
-    err.status = res.status;
-    err.code = data.code;
-    throw err;
-  }
-  return data;
-}
 
 /* ------------------------------- animated wave ------------------------------ */
 
@@ -171,33 +111,6 @@ function KpiCard({ icon: Icon, label, value, hint, accent, T }) {
   );
 }
 
-function SeverityBadge({ severity }) {
-  const s = SEV_STYLE[severity] || SEV_STYLE.Low;
-  return (
-    <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium" style={{ backgroundColor: s.bg, color: s.text, fontFamily: FONT_SANS }}>
-      <span style={{ width: 6, height: 6, borderRadius: 9999, backgroundColor: s.dot }} />
-      {severity}
-    </span>
-  );
-}
-
-function StatusSelect({ status, onChange }) {
-  const s = STATUS_STYLE[status] || STATUS_STYLE.Open;
-  return (
-    <select
-      value={status}
-      onChange={(e) => onChange(e.target.value)}
-      className="px-1.5 py-0.5 rounded text-xs font-medium outline-none cursor-pointer"
-      style={{ backgroundColor: s.bg, color: s.text, fontFamily: FONT_SANS, border: "none" }}
-      aria-label="Alert status"
-    >
-      {Object.keys(STATUS_STYLE).map((k) => (
-        <option key={k} value={k}>{k}</option>
-      ))}
-    </select>
-  );
-}
-
 function ThemeToggle({ theme, onChange }) {
   return (
     <button
@@ -226,6 +139,8 @@ function ConnectionBadge({ connected }) {
 function NavTabs({ view, setView, isAdmin }) {
   const items = [
     { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
+    { key: "alerts", label: "Alerts", icon: ShieldAlert },
+    { key: "events", label: "Events", icon: ScrollText },
     { key: "profile", label: "Profile", icon: UserIcon },
     { key: "settings", label: "Settings", icon: SettingsIcon },
     ...(isAdmin ? [{ key: "admin", label: "Admin", icon: Users }] : []),
@@ -746,6 +661,8 @@ const EMPTY_STATS = {
   severityBreakdown: [],
   volume: [],
   topSources: [],
+  topAttackers: [],
+  topTechniques: [],
 };
 
 function readStorage(key) {
@@ -798,6 +715,11 @@ export default function NocaSIEM() {
   const [alerts, setAlerts] = useState([]);
   const [logs, setLogs] = useState([]);
   const logRef = useRef(null);
+
+  const [openAlertId, setOpenAlertId] = useState(null);
+  const [alertFilters, setAlertFilters] = useState(null);
+  // Bumped on live events so the Alerts and Events pages reload too.
+  const [refreshKey, setRefreshKey] = useState(0);
 
   const [adminUsers, setAdminUsers] = useState([]);
   const [adminLoading, setAdminLoading] = useState(false);
@@ -936,6 +858,12 @@ export default function NocaSIEM() {
     }
   }
 
+  function openAlertsWith(filters) {
+    setOpenAlertId(null);
+    setAlertFilters({ ...filters });
+    setView("alerts");
+  }
+
   async function handleAlertStatus(id, status) {
     setAlerts((prev) => prev.map((a) => (a.id === id ? { ...a, status } : a)));
     try {
@@ -985,6 +913,7 @@ export default function NocaSIEM() {
       refreshTimer = setTimeout(() => {
         refreshTimer = null;
         refresh();
+        setRefreshKey((k) => k + 1);
       }, 500);
     }
 
@@ -1126,7 +1055,7 @@ export default function NocaSIEM() {
           <div className="flex items-center gap-2 sm:gap-3 shrink-0">
             <ThemeToggle theme={theme} onChange={setTheme} />
             <ConnectionBadge connected={connected} />
-            <button onClick={() => setView("dashboard")} className="relative" aria-label={`${stats.activeAlerts} active alerts`}>
+            <button onClick={() => openAlertsWith({ status: "Open" })} className="relative" aria-label={`${stats.activeAlerts} active alerts`}>
               <Bell size={17} color="rgba(255,255,255,0.85)" />
               {stats.activeAlerts > 0 && (
                 <span className="absolute -top-1.5 -right-2 flex items-center justify-center text-[10px] font-semibold text-white rounded-full px-1" style={{ minWidth: 15, height: 15, backgroundColor: T.crimson }}>
@@ -1217,24 +1146,24 @@ export default function NocaSIEM() {
             <div className="lg:col-span-2 rounded-lg overflow-hidden" style={{ backgroundColor: T.panel, border: `1px solid ${T.border}` }}>
               <div className="flex items-center justify-between px-4 sm:px-5 pt-4 pb-3">
                 <span className="text-sm font-semibold" style={{ color: T.ink }}>Recent alerts</span>
-                <span className="text-xs" style={{ color: T.slate }}>{connected ? "Live" : "Auto-refreshing"}</span>
+                <button onClick={() => setView("alerts")} className="text-xs font-medium" style={{ color: T.blueBright }}>View all alerts</button>
               </div>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
                     <tr style={{ borderTop: `1px solid ${T.border}`, borderBottom: `1px solid ${T.border}` }}>
-                      {["Time", "Severity", "Source IP", "Event type", "Status"].map((h) => (
+                      {["Time", "Severity", "Attacker IP", "Alert", "Status"].map((h) => (
                         <th key={h} className="text-left font-medium px-4 sm:px-5 py-2" style={{ color: T.slate, fontSize: 12 }}>{h}</th>
                       ))}
                     </tr>
                   </thead>
                   <tbody>
                     {alerts.map((a) => (
-                      <tr key={a.id} style={{ borderBottom: `1px solid ${T.border}` }} title={a.message}>
+                      <tr key={a.id} onClick={() => setOpenAlertId(a.id)} className="cursor-pointer" style={{ borderBottom: `1px solid ${T.border}` }} title="Open alert details">
                         <td className="px-4 sm:px-5 py-2.5 whitespace-nowrap" style={{ color: T.slate, fontFamily: FONT_MONO, fontSize: 12 }}>{timeLabel(new Date(a.createdAt))}</td>
                         <td className="px-4 sm:px-5 py-2.5"><SeverityBadge severity={a.severity} /></td>
-                        <td className="px-4 sm:px-5 py-2.5" style={{ fontFamily: FONT_MONO, fontSize: 12.5, color: T.ink }}>{a.sourceIp}</td>
-                        <td className="px-4 sm:px-5 py-2.5" style={{ color: T.ink }}>{a.type}</td>
+                        <td className="px-4 sm:px-5 py-2.5" style={{ fontFamily: FONT_MONO, fontSize: 12.5, color: T.ink }}>{a.srcIp || "\u2014"}</td>
+                        <td className="px-4 sm:px-5 py-2.5" style={{ color: T.ink }}>{a.title}</td>
                         <td className="px-4 sm:px-5 py-2.5"><StatusSelect status={a.status} onChange={(s) => handleAlertStatus(a.id, s)} /></td>
                       </tr>
                     ))}
@@ -1272,28 +1201,85 @@ export default function NocaSIEM() {
             </div>
           </div>
 
-          <div className="rounded-lg p-4 sm:p-5" style={{ backgroundColor: T.panel, border: `1px solid ${T.border}` }}>
-            <div className="flex items-center gap-2 mb-4">
-              <Globe size={15} color={T.blueBright} />
-              <span className="text-sm font-semibold" style={{ color: T.ink }}>Top source IPs</span>
-              <span className="text-xs ml-auto" style={{ color: T.slate }}>Last 24 hours</span>
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            <div className="rounded-lg p-4 sm:p-5" style={{ backgroundColor: T.panel, border: `1px solid ${T.border}` }}>
+              <div className="flex items-center gap-2 mb-4">
+                <Crosshair size={15} color={T.crimson} />
+                <span className="text-sm font-semibold" style={{ color: T.ink }}>Top attackers</span>
+                <span className="text-xs ml-auto" style={{ color: T.slate }}>Last 24 hours</span>
+              </div>
+              <div className="flex flex-col gap-2.5">
+                {stats.topAttackers.length === 0 && (
+                  <div className="text-xs text-center py-2" style={{ color: T.slate }}>No attacker IPs identified yet.</div>
+                )}
+                {stats.topAttackers.map((row) => (
+                  <button key={row.ip} onClick={() => openAlertsWith({ srcIp: row.ip })} className="flex items-center justify-between gap-2 text-left">
+                    <span style={{ fontFamily: FONT_MONO, fontSize: 12.5, color: T.blueBright }}>{row.ip}</span>
+                    <span className="flex items-center gap-2">
+                      <SeverityBadge severity={severityForLevel(row.maxLevel)} />
+                      <span className="text-xs w-16 text-right" style={{ color: T.slate }}>{row.count} alert{row.count === 1 ? "" : "s"}</span>
+                    </span>
+                  </button>
+                ))}
+              </div>
             </div>
-            <div className="flex flex-col gap-3">
-              {topIps.length === 0 && (
-                <div className="text-xs text-center py-2" style={{ color: T.slate }}>No events received yet.</div>
-              )}
-              {topIps.map((row) => (
-                <div key={row.ip} className="flex items-center gap-3">
-                  <span style={{ fontFamily: FONT_MONO, fontSize: 12.5, color: T.ink, width: 130 }}>{row.ip}</span>
-                  <div className="flex-1 rounded-full overflow-hidden" style={{ height: 7, backgroundColor: T.bg }}>
-                    <div style={{ width: `${(row.count / maxIp) * 100}%`, height: "100%", backgroundColor: T.blueBright, borderRadius: 9999 }} />
+
+            <div className="rounded-lg p-4 sm:p-5" style={{ backgroundColor: T.panel, border: `1px solid ${T.border}` }}>
+              <div className="flex items-center gap-2 mb-4">
+                <Target size={15} color={T.orange} />
+                <span className="text-sm font-semibold" style={{ color: T.ink }}>MITRE ATT&CK techniques</span>
+                <span className="text-xs ml-auto" style={{ color: T.slate }}>Last 24 hours</span>
+              </div>
+              <div className="flex flex-col gap-2.5">
+                {stats.topTechniques.length === 0 && (
+                  <div className="text-xs text-center py-2" style={{ color: T.slate }}>No techniques observed yet.</div>
+                )}
+                {stats.topTechniques.map((t) => (
+                  <button key={t.id} onClick={() => openAlertsWith({ mitre: t.id })} className="flex items-center justify-between gap-2 text-left">
+                    <span className="min-w-0">
+                      <span className="text-xs mr-2" style={{ fontFamily: FONT_MONO, color: T.blueBright }}>{t.id}</span>
+                      <span className="text-sm" style={{ color: T.ink }}>{t.name}</span>
+                      <span className="block text-xs" style={{ color: T.slate }}>{t.tactic}</span>
+                    </span>
+                    <span className="text-xs shrink-0" style={{ color: T.slate }}>{t.count}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="rounded-lg p-4 sm:p-5" style={{ backgroundColor: T.panel, border: `1px solid ${T.border}` }}>
+              <div className="flex items-center gap-2 mb-4">
+                <Globe size={15} color={T.blueBright} />
+                <span className="text-sm font-semibold" style={{ color: T.ink }}>Busiest devices</span>
+                <span className="text-xs ml-auto" style={{ color: T.slate }}>Last 24 hours</span>
+              </div>
+              <div className="flex flex-col gap-3">
+                {topIps.length === 0 && (
+                  <div className="text-xs text-center py-2" style={{ color: T.slate }}>No events received yet.</div>
+                )}
+                {topIps.map((row) => (
+                  <div key={row.ip} className="flex items-center gap-3">
+                    <span style={{ fontFamily: FONT_MONO, fontSize: 12.5, color: T.ink, width: 110 }}>{row.ip}</span>
+                    <div className="flex-1 rounded-full overflow-hidden" style={{ height: 7, backgroundColor: T.bg }}>
+                      <div style={{ width: `${(row.count / maxIp) * 100}%`, height: "100%", backgroundColor: T.blueBright, borderRadius: 9999 }} />
+                    </div>
+                    <span className="text-xs w-16 text-right" style={{ color: T.slate }}>{row.count.toLocaleString("en-US")}</span>
                   </div>
-                  <span className="text-xs w-20 text-right" style={{ color: T.slate }}>{row.count.toLocaleString("en-US")} events</span>
-                </div>
-              ))}
+                ))}
+              </div>
             </div>
           </div>
         </div>
+      )}
+
+      {view === "alerts" && (
+        <AlertsView T={T} authed={authed} refreshKey={refreshKey} filters={alertFilters} onOpenAlert={setOpenAlertId} onStatusChange={handleAlertStatus} />
+      )}
+
+      {view === "events" && <EventsView T={T} authed={authed} refreshKey={refreshKey} />}
+
+      {openAlertId && (
+        <AlertDetail T={T} alertId={openAlertId} authed={authed} onClose={() => setOpenAlertId(null)} onStatusChange={handleAlertStatus} onFilter={openAlertsWith} />
       )}
 
       {view === "profile" && (

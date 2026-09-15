@@ -12,7 +12,7 @@
     "test-log": "node scripts/send-test-log.js"
   },
   "engines": {
-    "node": ">=20.19"
+    "node": ">=22.13"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

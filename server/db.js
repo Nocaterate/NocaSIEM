@@ -1,382 +1,697 @@
-// Lightweight JSON-file data store.
-// This keeps the project dependency-free (no native DB bindings to compile),
-// which makes it easy to run anywhere. Swap this module out for a real
-// database (Postgres, MySQL, SQLite) later without touching the routes -
-// they only ever call the functions exported here.
+// SQLite data store (Node's built-in node:sqlite, no extra dependency).
+//
+// All routes and the ingest pipeline go through the functions exported here,
+// so the storage engine can be swapped without touching them. Every query
+// uses bound parameters - user input is never concatenated into SQL.
 
 import fs from "node:fs";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { describeTechniques } from "./engine/mitre.js";
 
-// Point DATA_FILE at a persistent disk/volume when deploying - many hosts
-// wipe the app directory on every redeploy.
-const DATA_FILE = path.resolve(process.env.DATA_FILE || path.join(import.meta.dirname, "..", "data.json"));
+const ROOT = path.resolve(import.meta.dirname, "..");
+const DB_FILE = path.resolve(process.env.DB_FILE || path.join(ROOT, "nocasiem.db"));
+const LEGACY_JSON = path.resolve(process.env.DATA_FILE || path.join(ROOT, "data.json"));
 
-const COLLECTIONS = ["users", "sources", "alerts", "logs", "auditLog"];
+const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
 
-function emptyState() {
-  return { users: [], sources: [], alerts: [], logs: [], auditLog: [], counters: {} };
+fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
+const db = new DatabaseSync(DB_FILE);
+try {
+  fs.chmodSync(DB_FILE, 0o600); // only the server's OS user can read hashes and logs
+} catch {
+  // not supported on every filesystem (e.g. Windows) - best effort
 }
 
-function load() {
-  fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-  let parsed = emptyState();
-  if (fs.existsSync(DATA_FILE)) {
-    try {
-      parsed = { ...emptyState(), ...JSON.parse(fs.readFileSync(DATA_FILE, "utf8")) };
-    } catch (err) {
-      // Keep the damaged file for recovery instead of silently wiping every account.
-      const backup = `${DATA_FILE}.corrupt-${Date.now()}`;
-      fs.renameSync(DATA_FILE, backup);
-      console.error(`Data file was unreadable (${err.message}). Moved it to ${backup} and started empty.`);
-      parsed = emptyState();
-    }
-  }
+db.exec(`
+  PRAGMA journal_mode = WAL;
+  PRAGMA synchronous = NORMAL;
+  PRAGMA foreign_keys = ON;
+  PRAGMA busy_timeout = 5000;
 
-  // Ids come from counters that only ever go up. Reusing a deleted user's id
-  // would let that user's old login token act as whoever got the id next.
-  parsed.counters = parsed.counters || {};
-  for (const name of COLLECTIONS) {
-    if (!Array.isArray(parsed[name])) parsed[name] = [];
-    const maxId = parsed[name].reduce((m, r) => Math.max(m, Number(r.id) || 0), 0);
-    parsed.counters[name] = Math.max(Number(parsed.counters[name]) || 0, maxId);
+  CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user',
+    status TEXT NOT NULL DEFAULT 'active',
+    token_version INTEGER NOT NULL DEFAULT 0,
+    last_login_at TEXT,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    ip TEXT NOT NULL UNIQUE,
+    port INTEGER NOT NULL,
+    protocol TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    last_seen TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS sources_user ON sources(user_id);
+
+  CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    action TEXT NOT NULL,
+    detail TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS audit_user ON audit_log(user_id, id);
+
+  CREATE TABLE IF NOT EXISTS logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    source_ip TEXT NOT NULL,
+    message TEXT NOT NULL,
+    host TEXT,
+    program TEXT,
+    decoder TEXT,
+    event_action TEXT,
+    src_ip TEXT,
+    dst_ip TEXT,
+    src_port INTEGER,
+    dst_port INTEGER,
+    user_name TEXT,
+    fields TEXT NOT NULL DEFAULT '{}',
+    rule_ids TEXT NOT NULL DEFAULT '[]'
+  );
+  CREATE INDEX IF NOT EXISTS logs_created ON logs(created_at);
+  CREATE INDEX IF NOT EXISTS logs_source ON logs(source_ip, id);
+  CREATE INDEX IF NOT EXISTS logs_src_ip ON logs(src_ip);
+  CREATE INDEX IF NOT EXISTS logs_decoder ON logs(decoder);
+
+  CREATE VIRTUAL TABLE IF NOT EXISTS logs_fts USING fts5(message, content='logs', content_rowid='id');
+  CREATE TRIGGER IF NOT EXISTS logs_ai AFTER INSERT ON logs BEGIN
+    INSERT INTO logs_fts(rowid, message) VALUES (new.id, new.message);
+  END;
+  CREATE TRIGGER IF NOT EXISTS logs_ad AFTER DELETE ON logs BEGIN
+    INSERT INTO logs_fts(logs_fts, rowid, message) VALUES ('delete', old.id, old.message);
+  END;
+
+  CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    log_id INTEGER REFERENCES logs(id) ON DELETE SET NULL,
+    source_ip TEXT NOT NULL,
+    rule_id INTEGER,
+    level INTEGER NOT NULL,
+    severity TEXT NOT NULL,
+    title TEXT NOT NULL,
+    rule_groups TEXT NOT NULL DEFAULT '[]',
+    mitre TEXT NOT NULL DEFAULT '[]',
+    src_ip TEXT,
+    user_name TEXT,
+    message TEXT,
+    fields TEXT NOT NULL DEFAULT '{}',
+    fired_times INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'Open'
+  );
+  CREATE INDEX IF NOT EXISTS alerts_created ON alerts(created_at);
+  CREATE INDEX IF NOT EXISTS alerts_source ON alerts(source_ip, id);
+  CREATE INDEX IF NOT EXISTS alerts_rule ON alerts(rule_id);
+  CREATE INDEX IF NOT EXISTS alerts_src_ip ON alerts(src_ip);
+  CREATE INDEX IF NOT EXISTS alerts_status ON alerts(status);
+`);
+
+const stmtCache = new Map();
+function q(sql) {
+  let s = stmtCache.get(sql);
+  if (!s) {
+    s = db.prepare(sql);
+    stmtCache.set(sql, s);
   }
-  return parsed;
+  return s;
 }
 
-const state = load();
-
-// ---- persistence ----
-let saveTimer = null;
-
-// Write to a temp file then rename, so a crash mid-write can never leave a
-// half-written data file behind. Mode 600: only the server's OS user can read
-// password hashes and logs.
-function writeNow() {
-  if (saveTimer) {
-    clearTimeout(saveTimer);
-    saveTimer = null;
-  }
-  const tmp = `${DATA_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
-  fs.renameSync(tmp, DATA_FILE);
+function transaction(fn) {
+  db.exec("BEGIN");
   try {
-    fs.chmodSync(DATA_FILE, 0o600);
-  } catch {
-    // not supported on every filesystem (e.g. Windows) - best effort
+    const result = fn();
+    db.exec("COMMIT");
+    return result;
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
   }
 }
 
-// Account and security changes are written immediately.
-function save() {
-  writeNow();
+function parseJson(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
 }
 
-// High-volume ingest writes are batched (at most once per second) so a flood
-// of log lines can't pin the server rewriting the file thousands of times.
-function saveSoon() {
-  if (!saveTimer) saveTimer = setTimeout(writeNow, 1000);
+const now = () => new Date().toISOString();
+
+// ------------------------------------------------------------------ users --
+
+function mapUser(r) {
+  if (!r) return undefined;
+  return {
+    id: r.id,
+    username: r.username,
+    email: r.email,
+    passwordHash: r.password_hash,
+    role: r.role,
+    status: r.status,
+    tokenVersion: r.token_version,
+    lastLoginAt: r.last_login_at,
+    createdAt: r.created_at,
+  };
 }
 
-// Called on shutdown so batched log writes aren't lost.
-function flush() {
-  if (saveTimer) writeNow();
-}
-
-writeNow();
-
-function nextId(collection) {
-  state.counters[collection] += 1;
-  return state.counters[collection];
-}
-
-// ---- users ----
 function findUserByEmail(email) {
-  const needle = String(email).trim().toLowerCase();
-  return state.users.find((u) => u.email.toLowerCase() === needle);
+  return mapUser(q("SELECT * FROM users WHERE email = ? COLLATE NOCASE").get(String(email).trim()));
 }
 
 function findUserById(id) {
-  return state.users.find((u) => u.id === id);
+  return mapUser(q("SELECT * FROM users WHERE id = ?").get(id));
 }
 
 function createUser({ username, email, passwordHash, role }) {
-  const user = {
-    id: nextId("users"),
-    username,
-    email: email.toLowerCase(),
-    passwordHash,
-    role: role || "user",
-    status: "active",
-    tokenVersion: 0,
-    lastLoginAt: null,
-    createdAt: new Date().toISOString(),
-  };
-  state.users.push(user);
-  save();
-  return user;
+  const r = q("INSERT INTO users (username, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)").run(username, email.toLowerCase(), passwordHash, role || "user", now());
+  return findUserById(Number(r.lastInsertRowid));
 }
 
 function userCount() {
-  return state.users.length;
+  return q("SELECT count(*) AS c FROM users").get().c;
 }
 
 function recordLogin(id) {
-  const user = findUserById(id);
-  if (!user) return null;
-  user.lastLoginAt = new Date().toISOString();
-  save();
-  return user;
+  q("UPDATE users SET last_login_at = ? WHERE id = ?").run(now(), id);
+  return findUserById(id);
 }
 
-// Invalidates every login token issued to this user so far.
-function revokeSessions(user) {
-  user.tokenVersion = (user.tokenVersion || 0) + 1;
-}
-
-// ---- admin: user management (never exposes passwordHash) ----
 function listAllUsers() {
-  return state.users.map((u) => ({
-    id: u.id,
-    username: u.username,
-    email: u.email,
-    role: u.role || "user",
-    status: u.status || "active",
-    createdAt: u.createdAt,
-    lastLoginAt: u.lastLoginAt || null,
-    sourceCount: state.sources.filter((s) => s.userId === u.id).length,
-  }));
-}
-
-function countAdmins() {
-  return state.users.filter((u) => (u.role || "user") === "admin").length;
-}
-
-function updateUserRole(id, role) {
-  const user = findUserById(id);
-  if (!user) return null;
-  user.role = role;
-  save();
-  return user;
-}
-
-function updateUserStatus(id, status) {
-  const user = findUserById(id);
-  if (!user) return null;
-  if (status === "suspended" && user.status !== "suspended") revokeSessions(user);
-  user.status = status;
-  save();
-  return user;
-}
-
-function deleteUserAccount(id) {
-  const before = state.users.length;
-  state.users = state.users.filter((u) => u.id !== id);
-  state.sources = state.sources.filter((s) => s.userId !== id);
-  save();
-  return state.users.length < before;
-}
-
-function listAllAuditLog(limit = 100) {
-  return state.auditLog
-    .slice(-limit)
-    .reverse()
-    .map((entry) => {
-      const u = findUserById(entry.userId);
-      return { ...entry, username: u ? u.username : `User #${entry.userId}` };
+  return q(`SELECT u.*, (SELECT count(*) FROM sources s WHERE s.user_id = u.id) AS source_count FROM users u ORDER BY u.id`)
+    .all()
+    .map((r) => {
+      const u = mapUser(r);
+      return { id: u.id, username: u.username, email: u.email, role: u.role, status: u.status, createdAt: u.createdAt, lastLoginAt: u.lastLoginAt, sourceCount: r.source_count };
     });
 }
 
-function updateUser(id, { username, email }) {
+function countAdmins() {
+  return q("SELECT count(*) AS c FROM users WHERE role = 'admin'").get().c;
+}
+
+function updateUserRole(id, role) {
+  q("UPDATE users SET role = ? WHERE id = ?").run(role, id);
+  return findUserById(id);
+}
+
+// Suspending bumps the token version, which revokes every existing session.
+function updateUserStatus(id, status) {
   const user = findUserById(id);
-  if (!user) return null;
-  if (username) user.username = username;
-  if (email) user.email = email.toLowerCase();
-  save();
-  return user;
+  if (!user) return undefined;
+  const bump = status === "suspended" && user.status !== "suspended" ? 1 : 0;
+  q("UPDATE users SET status = ?, token_version = token_version + ? WHERE id = ?").run(status, bump, id);
+  return findUserById(id);
+}
+
+function deleteUserAccount(id) {
+  return q("DELETE FROM users WHERE id = ?").run(id).changes > 0; // sources cascade
+}
+
+function updateUser(id, { username, email }) {
+  if (username) q("UPDATE users SET username = ? WHERE id = ?").run(username, id);
+  if (email) q("UPDATE users SET email = ? WHERE id = ?").run(email.toLowerCase(), id);
+  return findUserById(id);
 }
 
 // Changing the password signs out every other session.
 function updateUserPassword(id, passwordHash) {
-  const user = findUserById(id);
-  if (!user) return null;
-  user.passwordHash = passwordHash;
-  revokeSessions(user);
-  save();
-  return user;
+  q("UPDATE users SET password_hash = ?, token_version = token_version + 1 WHERE id = ?").run(passwordHash, id);
+  return findUserById(id);
 }
 
-// ---- audit log ----
+// -------------------------------------------------------------- audit log --
+
 function addAuditLog({ userId, action, detail }) {
-  const entry = {
-    id: nextId("auditLog"),
-    userId,
-    action,
-    detail,
-    createdAt: new Date().toISOString(),
-  };
-  state.auditLog.push(entry);
-  if (state.auditLog.length > 500) state.auditLog = state.auditLog.slice(-500);
-  save();
-  return entry;
+  const createdAt = now();
+  const r = q("INSERT INTO audit_log (user_id, action, detail, created_at) VALUES (?, ?, ?, ?)").run(userId ?? null, action, detail ?? null, createdAt);
+  return { id: Number(r.lastInsertRowid), userId, action, detail, createdAt };
+}
+
+function mapAudit(r) {
+  return { id: r.id, userId: r.user_id, action: r.action, detail: r.detail, createdAt: r.created_at };
 }
 
 function listAuditLog(userId, limit = 20) {
-  return state.auditLog
-    .filter((e) => e.userId === userId)
-    .slice(-limit)
-    .reverse();
+  return q("SELECT * FROM audit_log WHERE user_id = ? ORDER BY id DESC LIMIT ?").all(userId, limit).map(mapAudit);
 }
 
-// ---- visibility ----
-// Returns null when the user may see everything (admins), otherwise the Set
-// of source IPs they registered - logs/alerts are filtered down to those.
-function visibleIpsFor(user) {
-  if (!user) return new Set();
-  if ((user.role || "user") === "admin") return null;
-  return new Set(state.sources.filter((s) => s.userId === user.id).map((s) => s.ip));
+function listAllAuditLog(limit = 100) {
+  return q(`SELECT a.*, u.username FROM audit_log a LEFT JOIN users u ON u.id = a.user_id ORDER BY a.id DESC LIMIT ?`)
+    .all(limit)
+    .map((r) => ({ ...mapAudit(r), username: r.username || `User #${r.user_id}` }));
 }
 
-function inScope(rows, ips) {
-  return ips ? rows.filter((r) => ips.has(r.sourceIp)) : rows;
+// ---------------------------------------------------------------- sources --
+
+function mapSource(r) {
+  return r && { id: r.id, userId: r.user_id, name: r.name, ip: r.ip, port: r.port, protocol: r.protocol, status: r.status, lastSeen: r.last_seen, createdAt: r.created_at };
 }
 
-// ---- log sources ----
 function listSources(userId) {
-  return state.sources.filter((s) => s.userId === userId);
+  return q("SELECT * FROM sources WHERE user_id = ? ORDER BY id").all(userId).map(mapSource);
 }
 
 function findSourceByIp(ip) {
-  return state.sources.find((s) => s.ip === ip);
+  return mapSource(q("SELECT * FROM sources WHERE ip = ?").get(ip));
 }
 
 function isRegisteredIp(ip) {
-  return state.sources.some((s) => s.ip === ip);
+  return !!q("SELECT 1 FROM sources WHERE ip = ?").get(ip);
 }
 
 function createSource(userId, { name, ip, port, protocol }) {
-  const source = {
-    id: nextId("sources"),
-    userId,
-    name,
-    ip,
-    port,
-    protocol,
-    status: "pending",
-    lastSeen: null,
-    createdAt: new Date().toISOString(),
-  };
-  state.sources.push(source);
-  save();
-  return source;
+  const r = q("INSERT INTO sources (user_id, name, ip, port, protocol, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(userId, name, ip, port, protocol, now());
+  return mapSource(q("SELECT * FROM sources WHERE id = ?").get(Number(r.lastInsertRowid)));
 }
 
 function deleteSource(userId, sourceId) {
-  const before = state.sources.length;
-  state.sources = state.sources.filter((s) => !(s.id === sourceId && s.userId === userId));
-  save();
-  return state.sources.length < before;
+  return q("DELETE FROM sources WHERE id = ? AND user_id = ?").run(sourceId, userId).changes > 0;
 }
 
-// Called by the ingest listener whenever a line arrives, so the Settings
-// page can show "last seen" / active status per source.
+// Updates "last seen" at most every 10 seconds per source to avoid a write per line.
 function markSourceSeen(ip) {
-  const matches = state.sources.filter((s) => s.ip === ip);
-  if (!matches.length) return [];
-  const now = new Date().toISOString();
-  matches.forEach((s) => {
-    s.status = "active";
-    s.lastSeen = now;
-  });
-  saveSoon();
-  return matches;
+  const ts = now();
+  q("UPDATE sources SET status = 'active', last_seen = ? WHERE ip = ? AND (last_seen IS NULL OR last_seen < ?)").run(ts, ip, new Date(Date.now() - 10000).toISOString());
 }
 
-// ---- logs & alerts ----
-function addLog({ sourceIp, message }) {
-  const entry = {
-    id: nextId("logs"),
+// ------------------------------------------------------------- visibility --
+
+// null = sees everything (admin); otherwise the Set of the user's source IPs.
+function visibleIpsFor(user) {
+  if (!user) return new Set();
+  if (user.role === "admin") return null;
+  return new Set(q("SELECT ip FROM sources WHERE user_id = ?").all(user.id).map((r) => r.ip));
+}
+
+// Scope clause for logs/alerts: $scope is null for admins, else a user id.
+const SCOPE = "($scope IS NULL OR source_ip IN (SELECT ip FROM sources WHERE user_id = $scope))";
+
+// ------------------------------------------------------------ logs/alerts --
+
+function mapLog(r) {
+  return (
+    r && {
+      id: r.id,
+      createdAt: r.created_at,
+      sourceIp: r.source_ip,
+      message: r.message,
+      host: r.host,
+      program: r.program,
+      decoder: r.decoder,
+      action: r.event_action,
+      srcIp: r.src_ip,
+      dstIp: r.dst_ip,
+      srcPort: r.src_port,
+      dstPort: r.dst_port,
+      user: r.user_name,
+      fields: parseJson(r.fields, {}),
+      ruleIds: parseJson(r.rule_ids, []),
+    }
+  );
+}
+
+function mapAlert(r) {
+  if (!r) return undefined;
+  const mitreIds = parseJson(r.mitre, []);
+  return {
+    id: r.id,
+    createdAt: r.created_at,
+    logId: r.log_id,
+    sourceIp: r.source_ip,
+    ruleId: r.rule_id,
+    level: r.level,
+    severity: r.severity,
+    title: r.title,
+    type: r.title,
+    groups: parseJson(r.rule_groups, []),
+    mitre: describeTechniques(mitreIds),
+    srcIp: r.src_ip,
+    user: r.user_name,
+    message: r.message,
+    fields: parseJson(r.fields, {}),
+    firedTimes: r.fired_times,
+    status: r.status,
+  };
+}
+
+function toInt(v) {
+  return typeof v === "number" && Number.isFinite(v) ? Math.trunc(v) : null;
+}
+
+function addLog({ sourceIp, message, decoded, matchedRules = [] }) {
+  const f = decoded?.fields || {};
+  const createdAt = now();
+  const r = q(`INSERT INTO logs (created_at, source_ip, message, host, program, decoder, event_action, src_ip, dst_ip, src_port, dst_port, user_name, fields, rule_ids)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    createdAt,
     sourceIp,
     message,
-    createdAt: new Date().toISOString(),
-  };
-  state.logs.push(entry);
-  if (state.logs.length > 2000) state.logs = state.logs.slice(-2000);
-  saveSoon();
-  return entry;
+    decoded?.host ?? null,
+    decoded?.program ?? null,
+    decoded?.decoder ?? null,
+    f.action ?? null,
+    f.srcip ?? null,
+    f.dstip ?? null,
+    toInt(f.srcport),
+    toInt(f.dstport),
+    f.user ?? null,
+    JSON.stringify(f),
+    JSON.stringify(matchedRules)
+  );
+  return mapLog(q("SELECT * FROM logs WHERE id = ?").get(Number(r.lastInsertRowid)));
 }
 
-function addAlert({ sourceIp, severity, type, message }) {
-  const alert = {
-    id: nextId("alerts"),
+function addAlert({ logId, sourceIp, message, fields = {}, alert }) {
+  const r = q(`INSERT INTO alerts (created_at, log_id, source_ip, rule_id, level, severity, title, rule_groups, mitre, src_ip, user_name, message, fields, fired_times)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    now(),
+    logId ?? null,
     sourceIp,
-    severity,
-    type,
-    message,
-    status: "Open",
-    createdAt: new Date().toISOString(),
-  };
-  state.alerts.push(alert);
-  if (state.alerts.length > 1000) state.alerts = state.alerts.slice(-1000);
-  saveSoon();
-  return alert;
+    alert.ruleId ?? null,
+    alert.level,
+    alert.severity,
+    alert.title,
+    JSON.stringify(alert.groups || []),
+    JSON.stringify(alert.mitre || []),
+    alert.srcIp ?? null,
+    alert.user ?? null,
+    message ?? null,
+    JSON.stringify(fields),
+    alert.firedTimes || 1
+  );
+  return mapAlert(q("SELECT * FROM alerts WHERE id = ?").get(Number(r.lastInsertRowid)));
 }
 
-function listLogs(limit = 100, ips = null) {
-  return inScope(state.logs, ips).slice(-limit).reverse();
+// Turns free text into a safe FTS5 query: every word becomes a quoted term
+// (so FTS operators typed by a user are treated as plain text).
+function ftsQuery(text) {
+  const terms = String(text).match(/[\p{L}\p{N}_.:@\-/]+/gu) || [];
+  return terms
+    .slice(0, 12)
+    .map((t) => `"${t.replace(/"/g, "")}"`)
+    .join(" ");
 }
 
-function listAlerts(limit = 100, ips = null) {
-  return inScope(state.alerts, ips).slice(-limit).reverse();
+function likeEscape(text) {
+  return `%${String(text).replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
 }
 
-function updateAlertStatus(id, status, ips = null) {
-  const alert = inScope(state.alerts, ips).find((a) => a.id === id);
-  if (!alert) return null;
-  alert.status = status;
-  save();
-  return alert;
+// filters: q, sourceIp, srcIp, user, decoder, action, from, to, before, limit
+function searchLogs(filters, scopeUserId) {
+  const where = [SCOPE];
+  const params = { $scope: scopeUserId ?? null, $limit: filters.limit };
+  if (filters.q) {
+    const fts = ftsQuery(filters.q);
+    if (fts) {
+      where.push("id IN (SELECT rowid FROM logs_fts WHERE logs_fts MATCH $fts)");
+      params.$fts = fts;
+    }
+  }
+  if (filters.sourceIp) {
+    where.push("source_ip = $sourceIp");
+    params.$sourceIp = filters.sourceIp;
+  }
+  if (filters.srcIp) {
+    where.push("src_ip = $srcIp");
+    params.$srcIp = filters.srcIp;
+  }
+  if (filters.user) {
+    where.push("user_name = $user COLLATE NOCASE");
+    params.$user = filters.user;
+  }
+  if (filters.decoder) {
+    where.push("decoder = $decoder");
+    params.$decoder = filters.decoder;
+  }
+  if (filters.action) {
+    where.push("event_action = $action");
+    params.$action = filters.action;
+  }
+  if (filters.from) {
+    where.push("created_at >= $from");
+    params.$from = filters.from;
+  }
+  if (filters.to) {
+    where.push("created_at <= $to");
+    params.$to = filters.to;
+  }
+  if (filters.before) {
+    where.push("id < $before");
+    params.$before = filters.before;
+  }
+  const rows = db.prepare(`SELECT * FROM logs WHERE ${where.join(" AND ")} ORDER BY id DESC LIMIT $limit`).all(params);
+  return rows.map(mapLog);
 }
 
-const HOUR_MS = 60 * 60 * 1000;
+// filters: q, severity[], status, ruleId, mitre, srcIp, sourceIp, user, levelMin, from, to, before, limit
+function searchAlerts(filters, scopeUserId) {
+  const where = [SCOPE];
+  const params = { $scope: scopeUserId ?? null, $limit: filters.limit };
+  if (filters.q) {
+    where.push("(title LIKE $q ESCAPE '\\' OR message LIKE $q ESCAPE '\\')");
+    params.$q = likeEscape(filters.q);
+  }
+  if (filters.severity?.length) {
+    where.push("severity IN (SELECT value FROM json_each($severity))");
+    params.$severity = JSON.stringify(filters.severity);
+  }
+  if (filters.status) {
+    where.push("status = $status");
+    params.$status = filters.status;
+  }
+  if (filters.ruleId) {
+    where.push("rule_id = $ruleId");
+    params.$ruleId = filters.ruleId;
+  }
+  if (filters.mitre) {
+    where.push("EXISTS (SELECT 1 FROM json_each(alerts.mitre) WHERE value = $mitre)");
+    params.$mitre = filters.mitre;
+  }
+  if (filters.srcIp) {
+    where.push("src_ip = $srcIp");
+    params.$srcIp = filters.srcIp;
+  }
+  if (filters.sourceIp) {
+    where.push("source_ip = $sourceIp");
+    params.$sourceIp = filters.sourceIp;
+  }
+  if (filters.user) {
+    where.push("user_name = $user COLLATE NOCASE");
+    params.$user = filters.user;
+  }
+  if (filters.levelMin) {
+    where.push("level >= $levelMin");
+    params.$levelMin = filters.levelMin;
+  }
+  if (filters.from) {
+    where.push("created_at >= $from");
+    params.$from = filters.from;
+  }
+  if (filters.to) {
+    where.push("created_at <= $to");
+    params.$to = filters.to;
+  }
+  if (filters.before) {
+    where.push("id < $before");
+    params.$before = filters.before;
+  }
+  const rows = db.prepare(`SELECT * FROM alerts WHERE ${where.join(" AND ")} ORDER BY id DESC LIMIT $limit`).all(params);
+  return rows.map(mapAlert);
+}
 
-function getStats(ips = null) {
-  const now = Date.now();
-  const last24h = now - 24 * HOUR_MS;
-  const recentLogs = inScope(state.logs, ips).filter((l) => new Date(l.createdAt).getTime() >= last24h);
-  const recentAlerts = inScope(state.alerts, ips).filter((a) => new Date(a.createdAt).getTime() >= last24h);
+function listLogs(limit = 100, scopeUserId = null) {
+  return searchLogs({ limit }, scopeUserId);
+}
 
-  // 24 hourly buckets, oldest first, ending with the current hour.
-  const currentHour = Math.floor(now / HOUR_MS) * HOUR_MS;
-  const volume = Array.from({ length: 24 }, (_, i) => ({
-    start: new Date(currentHour - (23 - i) * HOUR_MS).toISOString(),
-    events: 0,
-  }));
-  const ipCounts = new Map();
-  let lastMinute = 0;
-  recentLogs.forEach((l) => {
-    const t = new Date(l.createdAt).getTime();
-    const idx = 23 - Math.floor((currentHour - Math.floor(t / HOUR_MS) * HOUR_MS) / HOUR_MS);
-    if (idx >= 0 && idx < 24) volume[idx].events += 1;
-    if (now - t < 60 * 1000) lastMinute += 1;
-    ipCounts.set(l.sourceIp, (ipCounts.get(l.sourceIp) || 0) + 1);
+function listAlerts(limit = 100, scopeUserId = null) {
+  return searchAlerts({ limit }, scopeUserId);
+}
+
+function getLog(id, scopeUserId) {
+  return mapLog(q(`SELECT * FROM logs WHERE id = $id AND ${SCOPE}`).get({ $id: id, $scope: scopeUserId ?? null }));
+}
+
+function getAlert(id, scopeUserId) {
+  return mapAlert(q(`SELECT * FROM alerts WHERE id = $id AND ${SCOPE}`).get({ $id: id, $scope: scopeUserId ?? null }));
+}
+
+// Other alerts involving the same attacker IP (or the same device when the
+// alert has no attacker IP) in the 24 hours around it.
+function relatedAlerts(alert, scopeUserId, limit = 10) {
+  const t = new Date(alert.createdAt).getTime();
+  const params = { $id: alert.id, $scope: scopeUserId ?? null, $from: new Date(t - DAY_MS).toISOString(), $to: new Date(t + DAY_MS).toISOString(), $limit: limit };
+  let match;
+  if (alert.srcIp) {
+    match = "src_ip = $ip";
+    params.$ip = alert.srcIp;
+  } else {
+    match = "source_ip = $ip";
+    params.$ip = alert.sourceIp;
+  }
+  return q(`SELECT * FROM alerts WHERE id != $id AND ${match} AND created_at BETWEEN $from AND $to AND ${SCOPE} ORDER BY id DESC LIMIT $limit`)
+    .all(params)
+    .map(mapAlert);
+}
+
+function updateAlertStatus(id, status, scopeUserId = null) {
+  const r = q(`UPDATE alerts SET status = $status WHERE id = $id AND ${SCOPE}`).run({ $status: status, $id: id, $scope: scopeUserId ?? null });
+  return r.changes > 0 ? getAlert(id, scopeUserId) : undefined;
+}
+
+function getStats(scopeUserId = null) {
+  const nowMs = Date.now();
+  const p = { $scope: scopeUserId ?? null, $since: new Date(nowMs - DAY_MS).toISOString() };
+
+  const totalEvents = q(`SELECT count(*) AS c FROM logs WHERE created_at >= $since AND ${SCOPE}`).get(p).c;
+  const lastMinute = q(`SELECT count(*) AS c FROM logs WHERE created_at >= $since AND ${SCOPE}`).get({ ...p, $since: new Date(nowMs - 60000).toISOString() }).c;
+
+  // 24 hourly buckets (UTC hours), oldest first, ending with the current hour.
+  const currentHour = Math.floor(nowMs / HOUR_MS) * HOUR_MS;
+  const hourly = new Map(
+    q(`SELECT substr(created_at, 1, 13) AS h, count(*) AS c FROM logs WHERE created_at >= $from AND ${SCOPE} GROUP BY h`)
+      .all({ $scope: p.$scope, $from: new Date(currentHour - 23 * HOUR_MS).toISOString() })
+      .map((r) => [r.h, r.c])
+  );
+  const volume = Array.from({ length: 24 }, (_, i) => {
+    const start = new Date(currentHour - (23 - i) * HOUR_MS).toISOString();
+    return { start, events: hourly.get(start.slice(0, 13)) || 0 };
   });
+
+  const severityRows = q(`SELECT severity, count(*) AS c FROM alerts WHERE created_at >= $since AND ${SCOPE} GROUP BY severity`).all(p);
+  const alertCounts = q(`SELECT
+      sum(CASE WHEN status != 'Resolved' THEN 1 ELSE 0 END) AS active,
+      sum(CASE WHEN status != 'Resolved' AND severity = 'Critical' THEN 1 ELSE 0 END) AS critical
+    FROM alerts WHERE created_at >= $since AND ${SCOPE}`).get(p);
+
+  const topSources = q(`SELECT source_ip AS ip, count(*) AS count FROM logs WHERE created_at >= $since AND ${SCOPE} GROUP BY source_ip ORDER BY count DESC LIMIT 5`).all(p).map((r) => ({ ip: r.ip, count: r.count }));
+
+  const topAttackers = q(`SELECT src_ip AS ip, count(*) AS count, max(level) AS maxLevel FROM alerts
+      WHERE created_at >= $since AND src_ip IS NOT NULL AND ${SCOPE} GROUP BY src_ip ORDER BY maxLevel DESC, count DESC LIMIT 5`)
+    .all(p)
+    .map((r) => ({ ip: r.ip, count: r.count, maxLevel: r.maxLevel }));
+
+  const techniqueRows = q(`SELECT j.value AS id, count(*) AS count FROM alerts, json_each(alerts.mitre) AS j
+      WHERE alerts.created_at >= $since AND ${SCOPE.replace(/source_ip/g, "alerts.source_ip")} GROUP BY j.value ORDER BY count DESC LIMIT 6`).all(p);
+  const described = describeTechniques(techniqueRows.map((r) => r.id));
+  const topTechniques = techniqueRows.map((r, i) => ({ ...described[i], count: r.count }));
 
   return {
-    totalEvents: recentLogs.length,
-    activeAlerts: recentAlerts.filter((a) => a.status !== "Resolved").length,
-    criticalIncidents: recentAlerts.filter((a) => a.severity === "Critical" && a.status !== "Resolved").length,
+    totalEvents,
+    activeAlerts: alertCounts.active || 0,
+    criticalIncidents: alertCounts.critical || 0,
     eventsPerSecond: Math.round((lastMinute / 60) * 10) / 10,
-    severityBreakdown: ["Critical", "High", "Medium", "Low"].map((sev) => ({
-      name: sev,
-      value: recentAlerts.filter((a) => a.severity === sev).length,
-    })),
+    severityBreakdown: ["Critical", "High", "Medium", "Low"].map((name) => ({ name, value: severityRows.find((r) => r.severity === name)?.c || 0 })),
     volume,
-    topSources: [...ipCounts.entries()]
-      .map(([ip, count]) => ({ ip, count }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 5),
+    topSources,
+    topAttackers,
+    topTechniques,
   };
 }
+
+// -------------------------------------------------------------- retention --
+
+function retentionDays(name, fallback) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+// Deletes old rows in batches so a big cleanup never blocks the server for long.
+function pruneOld() {
+  const logCutoff = new Date(Date.now() - retentionDays("LOG_RETENTION_DAYS", 90) * DAY_MS).toISOString();
+  const alertCutoff = new Date(Date.now() - retentionDays("ALERT_RETENTION_DAYS", 365) * DAY_MS).toISOString();
+  let removed = 0;
+  for (const [table, cutoff] of [["alerts", alertCutoff], ["logs", logCutoff]]) {
+    let changes;
+    do {
+      changes = q(`DELETE FROM ${table} WHERE id IN (SELECT id FROM ${table} WHERE created_at < ? LIMIT 5000)`).run(cutoff).changes;
+      removed += changes;
+    } while (changes === 5000);
+  }
+  q("DELETE FROM audit_log WHERE id <= (SELECT id FROM audit_log ORDER BY id DESC LIMIT 1 OFFSET 10000)").run();
+  return removed;
+}
+
+// Checkpoints the write-ahead log on shutdown.
+function flush() {
+  try {
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  } catch {
+    // database may already be closed
+  }
+}
+
+// ------------------------------------------------- import old data.json --
+
+// Earlier versions stored everything in data.json. Import it once into
+// SQLite (keeping ids, so existing sessions stay valid), then rename the file.
+function importLegacyJson() {
+  if (!fs.existsSync(LEGACY_JSON) || userCount() > 0) return;
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(LEGACY_JSON, "utf8"));
+  } catch (err) {
+    console.error(`Couldn't read ${LEGACY_JSON} for import: ${err.message}`);
+    return;
+  }
+  const levelFor = { Critical: 12, High: 10, Medium: 7, Low: 5 };
+
+  transaction(() => {
+    for (const u of data.users || []) {
+      q("INSERT INTO users (id, username, email, password_hash, role, status, token_version, last_login_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+        u.id, u.username, String(u.email).toLowerCase(), u.passwordHash, u.role || "user", u.status || "active", u.tokenVersion || 0, u.lastLoginAt || null, u.createdAt || now()
+      );
+    }
+    for (const s of data.sources || []) {
+      q("INSERT OR IGNORE INTO sources (id, user_id, name, ip, port, protocol, status, last_seen, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+        s.id, s.userId, s.name, s.ip, s.port, s.protocol, s.status || "pending", s.lastSeen || null, s.createdAt || now()
+      );
+    }
+    for (const a of data.auditLog || []) {
+      q("INSERT INTO audit_log (id, user_id, action, detail, created_at) VALUES (?, ?, ?, ?, ?)").run(a.id, a.userId ?? null, a.action, a.detail ?? null, a.createdAt || now());
+    }
+    for (const l of data.logs || []) {
+      q("INSERT INTO logs (created_at, source_ip, message, decoder) VALUES (?, ?, ?, 'legacy')").run(l.createdAt || now(), l.sourceIp, l.message);
+    }
+    for (const a of data.alerts || []) {
+      q("INSERT INTO alerts (created_at, source_ip, level, severity, title, message, status) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+        a.createdAt || now(), a.sourceIp, levelFor[a.severity] || 5, a.severity || "Low", a.type || "Legacy alert", a.message ?? null, a.status || "Open"
+      );
+    }
+    // Never hand out an id the old store already used.
+    const counters = data.counters || {};
+    for (const [table, key] of [["users", "users"], ["sources", "sources"], ["audit_log", "auditLog"]]) {
+      const seq = Number(counters[key]) || 0;
+      if (q("UPDATE sqlite_sequence SET seq = max(seq, ?) WHERE name = ?").run(seq, table).changes === 0 && seq > 0) {
+        q("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)").run(table, seq);
+      }
+    }
+    q("INSERT OR REPLACE INTO meta (key, value) VALUES ('legacy_import', ?)").run(`${LEGACY_JSON} at ${now()}`);
+  });
+
+  const renamed = `${LEGACY_JSON}.imported`;
+  fs.renameSync(LEGACY_JSON, renamed);
+  console.log(`Imported ${data.users?.length || 0} users and ${data.sources?.length || 0} sources from ${path.basename(LEGACY_JSON)} into ${path.basename(DB_FILE)}. The old file was renamed to ${path.basename(renamed)} - delete it once you've checked everything works.`);
+}
+
+importLegacyJson();
+pruneOld();
+setInterval(pruneOld, HOUR_MS).unref();
 
 export {
   flush,
@@ -404,8 +719,14 @@ export {
   markSourceSeen,
   addLog,
   addAlert,
+  searchLogs,
+  searchAlerts,
   listLogs,
   listAlerts,
+  getLog,
+  getAlert,
+  relatedAlerts,
   updateAlertStatus,
   getStats,
+  pruneOld,
 };

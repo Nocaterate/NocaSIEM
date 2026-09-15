@@ -12,5 +12,9 @@ dist/
 .env
 .env.*
 !.env.example
+*.db
+*.db-wal
+*.db-shm
 data.json
-data.json.tmp
+data.json.*
+.test-data/

@@ -351,8 +351,11 @@ function ProfileView({ user, T, onLogout, theme, onThemeChange, onUpdateProfile,
   const [editing, setEditing] = useState(false);
   const [username, setUsername] = useState(user.username);
   const [email, setEmail] = useState(user.email);
+  const [profilePassword, setProfilePassword] = useState("");
   const [profileError, setProfileError] = useState("");
   const [profileSaving, setProfileSaving] = useState(false);
+  // The server requires the current password to change the sign-in email.
+  const emailChanged = email.trim().toLowerCase() !== user.email.toLowerCase();
 
   const [showPasswordForm, setShowPasswordForm] = useState(false);
   const [currentPassword, setCurrentPassword] = useState("");
@@ -365,7 +368,8 @@ function ProfileView({ user, T, onLogout, theme, onThemeChange, onUpdateProfile,
     setProfileError("");
     setProfileSaving(true);
     try {
-      await onUpdateProfile({ username, email });
+      await onUpdateProfile(emailChanged ? { username, email, currentPassword: profilePassword } : { username });
+      setProfilePassword("");
       setEditing(false);
     } catch (err) {
       setProfileError(err.message);
@@ -407,14 +411,17 @@ function ProfileView({ user, T, onLogout, theme, onThemeChange, onUpdateProfile,
               <div className="text-base font-semibold" style={{ color: T.ink }}>{user.username}</div>
               <div className="text-sm" style={{ color: T.slate }}>{user.email}</div>
             </div>
-            <button onClick={() => { setUsername(user.username); setEmail(user.email); setEditing(true); }} className="text-xs font-medium px-3 py-1.5 rounded-md" style={{ border: `1px solid ${T.border}`, color: T.ink }}>
+            <button onClick={() => { setUsername(user.username); setEmail(user.email); setProfilePassword(""); setEditing(true); }} className="text-xs font-medium px-3 py-1.5 rounded-md" style={{ border: `1px solid ${T.border}`, color: T.ink }}>
               Edit
             </button>
           </div>
         ) : (
           <div className="flex-1 flex flex-col gap-2">
-            <input value={username} onChange={(e) => setUsername(e.target.value)} className="px-2.5 py-1.5 rounded-md text-sm outline-none" style={fieldStyle} placeholder="Username" />
-            <input value={email} onChange={(e) => setEmail(e.target.value)} type="email" className="px-2.5 py-1.5 rounded-md text-sm outline-none" style={fieldStyle} placeholder="Email" />
+            <input value={username} onChange={(e) => setUsername(e.target.value)} maxLength={50} className="px-2.5 py-1.5 rounded-md text-sm outline-none" style={fieldStyle} placeholder="Username" />
+            <input value={email} onChange={(e) => setEmail(e.target.value)} type="email" maxLength={254} className="px-2.5 py-1.5 rounded-md text-sm outline-none" style={fieldStyle} placeholder="Email" />
+            {emailChanged && (
+              <input value={profilePassword} onChange={(e) => setProfilePassword(e.target.value)} type="password" autoComplete="current-password" className="px-2.5 py-1.5 rounded-md text-sm outline-none" style={fieldStyle} placeholder="Current password (required to change email)" />
+            )}
           </div>
         )}
       </div>
@@ -881,7 +888,13 @@ export default function NocaSIEM() {
   }
 
   async function handleChangePassword(fields) {
-    await authed("/api/auth/password", { method: "PATCH", body: fields });
+    // Changing the password revokes every existing session; keep this one
+    // signed in with the fresh token the server returns.
+    const data = await authed("/api/auth/password", { method: "PATCH", body: fields });
+    if (data.token) {
+      writeStorage(TOKEN_KEY, data.token);
+      setToken(data.token);
+    }
   }
 
   async function handleTestSource(id) {

@@ -53,8 +53,8 @@ npm start
 `build` compiles the dashboard into `dist/`; `start` serves it together with
 the API. `start` refuses to run with a missing or weak `JWT_SECRET`.
 
-**Send a test log** (register a source with IP `127.0.0.1` first, or sign in
-as the admin, who sees everything):
+**Send a test log** (register a source with IP `127.0.0.1` first; lines from
+unregistered IPs are dropped):
 
 ```bash
 echo "Failed password for root from 10.0.0.7" | nc -u -w0 127.0.0.1 5514
@@ -74,6 +74,10 @@ Set these in `.env` locally, or as environment variables on your host.
 |----------------------|----------|-------|
 | `JWT_SECRET`         | yes      | 32+ random characters. Generate: `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"`. Changing it signs everyone out. |
 | `ALLOW_REGISTRATION` | recommended | Set to `false` after creating your admin account so strangers can't sign up. |
+| `ADMIN_EMAIL`        | recommended for new deploys | Only this email can create the first (admin) account on an empty instance. |
+| `INGEST_ALLOW_UNREGISTERED` | no | Default `false`: log lines from IPs not registered as a source are dropped. |
+| `INGEST_RATE_LIMIT`  | no       | Max log lines per second per source IP (default 100). |
+| `HOST`               | no       | Listen address. `npm run dev` defaults to `127.0.0.1`; `npm start` to all interfaces. |
 | `DATA_FILE`          | recommended in production | Path on a **persistent** disk, e.g. `/data/nocasiem.json`. Defaults to `data.json` in the project folder. |
 | `TRUST_PROXY`        | behind a proxy | `1` when behind Nginx/Caddy/a PaaS load balancer, so login lockouts use real client IPs. |
 | `PORT`               | no       | Most hosts set this automatically. |
@@ -104,7 +108,13 @@ Build command: `npm install && npm run build` · Start command: `npm start`
 
 - Use HTTPS. Login tokens travel in request headers.
 - Set a fresh `JWT_SECRET`.
-- Set `ALLOW_REGISTRATION=false` once your account exists.
+- Set `ADMIN_EMAIL` before the first start on a public server, then
+  `ALLOW_REGISTRATION=false` once your account exists.
+- Set `TRUST_PROXY=1` only when a proxy is in front of the app (never when
+  clients connect directly, or they could fake their IP to dodge rate limits).
+- Firewall the syslog ports to your devices' IPs. UDP source addresses can be
+  spoofed, so an open UDP port lets anyone inject fake log lines for a
+  registered IP.
 - Never commit `.env` or `data.json` (both are gitignored).
 - Storage is a single JSON file, which is fine for a personal or small team
   instance. For heavy log volume, swap `server/db.js` for a real database;

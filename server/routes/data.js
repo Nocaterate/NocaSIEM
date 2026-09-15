@@ -1,6 +1,7 @@
 import express from "express";
 import * as db from "../db.js";
 import { requireAuth } from "../middleware/auth.js";
+import { clampLimit, parseId } from "../utils/validate.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -16,8 +17,7 @@ router.get("/stats", (req, res) => {
 });
 
 router.get("/alerts", (req, res) => {
-  const limit = Math.min(Number(req.query.limit) || 50, 500);
-  res.json({ alerts: db.listAlerts(limit, scopeFor(req)) });
+  res.json({ alerts: db.listAlerts(clampLimit(req.query.limit, 50, 500), scopeFor(req)) });
 });
 
 router.patch("/alerts/:id", (req, res) => {
@@ -25,19 +25,18 @@ router.patch("/alerts/:id", (req, res) => {
   if (!["Open", "Investigating", "Resolved"].includes(status)) {
     return res.status(400).json({ error: "status must be Open, Investigating or Resolved" });
   }
-  const alert = db.updateAlertStatus(Number(req.params.id), status, scopeFor(req));
+  const id = parseId(req.params.id);
+  const alert = id && db.updateAlertStatus(id, status, scopeFor(req));
   if (!alert) return res.status(404).json({ error: "Alert not found" });
   res.json({ alert });
 });
 
 router.get("/logs", (req, res) => {
-  const limit = Math.min(Number(req.query.limit) || 100, 500);
-  res.json({ logs: db.listLogs(limit, scopeFor(req)) });
+  res.json({ logs: db.listLogs(clampLimit(req.query.limit, 100, 500), scopeFor(req)) });
 });
 
 router.get("/audit-log", (req, res) => {
-  const limit = Math.min(Number(req.query.limit) || 20, 100);
-  res.json({ auditLog: db.listAuditLog(req.userId, limit) });
+  res.json({ auditLog: db.listAuditLog(req.userId, clampLimit(req.query.limit, 20, 100)) });
 });
 
 export default router;

@@ -11,46 +11,88 @@ import path from "node:path";
 // wipe the app directory on every redeploy.
 const DATA_FILE = path.resolve(process.env.DATA_FILE || path.join(import.meta.dirname, "..", "data.json"));
 
-const EMPTY_STATE = {
-  users: [],
-  sources: [],
-  alerts: [],
-  logs: [],
-  auditLog: [],
-};
+const COLLECTIONS = ["users", "sources", "alerts", "logs", "auditLog"];
+
+function emptyState() {
+  return { users: [], sources: [], alerts: [], logs: [], auditLog: [], counters: {} };
+}
 
 function load() {
-  if (!fs.existsSync(DATA_FILE)) {
-    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-    fs.writeFileSync(DATA_FILE, JSON.stringify(EMPTY_STATE, null, 2));
+  fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+  let parsed = emptyState();
+  if (fs.existsSync(DATA_FILE)) {
+    try {
+      parsed = { ...emptyState(), ...JSON.parse(fs.readFileSync(DATA_FILE, "utf8")) };
+    } catch (err) {
+      // Keep the damaged file for recovery instead of silently wiping every account.
+      const backup = `${DATA_FILE}.corrupt-${Date.now()}`;
+      fs.renameSync(DATA_FILE, backup);
+      console.error(`Data file was unreadable (${err.message}). Moved it to ${backup} and started empty.`);
+      parsed = emptyState();
+    }
   }
-  const raw = fs.readFileSync(DATA_FILE, "utf8");
-  try {
-    return JSON.parse(raw);
-  } catch (err) {
-    console.error("data.json is corrupted, resetting to empty state:", err);
-    fs.writeFileSync(DATA_FILE, JSON.stringify(EMPTY_STATE, null, 2));
-    return { ...EMPTY_STATE };
+
+  // Ids come from counters that only ever go up. Reusing a deleted user's id
+  // would let that user's old login token act as whoever got the id next.
+  parsed.counters = parsed.counters || {};
+  for (const name of COLLECTIONS) {
+    if (!Array.isArray(parsed[name])) parsed[name] = [];
+    const maxId = parsed[name].reduce((m, r) => Math.max(m, Number(r.id) || 0), 0);
+    parsed.counters[name] = Math.max(Number(parsed.counters[name]) || 0, maxId);
   }
+  return parsed;
 }
 
-// Write to a temp file then rename, so a crash mid-write can never leave
-// a half-written (corrupted) data.json behind.
-function save(state) {
+const state = load();
+
+// ---- persistence ----
+let saveTimer = null;
+
+// Write to a temp file then rename, so a crash mid-write can never leave a
+// half-written data file behind. Mode 600: only the server's OS user can read
+// password hashes and logs.
+function writeNow() {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
   const tmp = `${DATA_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, DATA_FILE);
+  try {
+    fs.chmodSync(DATA_FILE, 0o600);
+  } catch {
+    // not supported on every filesystem (e.g. Windows) - best effort
+  }
 }
 
-let state = load();
+// Account and security changes are written immediately.
+function save() {
+  writeNow();
+}
+
+// High-volume ingest writes are batched (at most once per second) so a flood
+// of log lines can't pin the server rewriting the file thousands of times.
+function saveSoon() {
+  if (!saveTimer) saveTimer = setTimeout(writeNow, 1000);
+}
+
+// Called on shutdown so batched log writes aren't lost.
+function flush() {
+  if (saveTimer) writeNow();
+}
+
+writeNow();
 
 function nextId(collection) {
-  return collection.length ? Math.max(...collection.map((r) => r.id)) + 1 : 1;
+  state.counters[collection] += 1;
+  return state.counters[collection];
 }
 
 // ---- users ----
 function findUserByEmail(email) {
-  return state.users.find((u) => u.email.toLowerCase() === email.toLowerCase());
+  const needle = String(email).trim().toLowerCase();
+  return state.users.find((u) => u.email.toLowerCase() === needle);
 }
 
 function findUserById(id) {
@@ -59,17 +101,18 @@ function findUserById(id) {
 
 function createUser({ username, email, passwordHash, role }) {
   const user = {
-    id: nextId(state.users),
+    id: nextId("users"),
     username,
-    email,
+    email: email.toLowerCase(),
     passwordHash,
     role: role || "user",
     status: "active",
+    tokenVersion: 0,
     lastLoginAt: null,
     createdAt: new Date().toISOString(),
   };
   state.users.push(user);
-  save(state);
+  save();
   return user;
 }
 
@@ -78,11 +121,16 @@ function userCount() {
 }
 
 function recordLogin(id) {
-  const user = state.users.find((u) => u.id === id);
+  const user = findUserById(id);
   if (!user) return null;
   user.lastLoginAt = new Date().toISOString();
-  save(state);
+  save();
   return user;
+}
+
+// Invalidates every login token issued to this user so far.
+function revokeSessions(user) {
+  user.tokenVersion = (user.tokenVersion || 0) + 1;
 }
 
 // ---- admin: user management (never exposes passwordHash) ----
@@ -104,18 +152,19 @@ function countAdmins() {
 }
 
 function updateUserRole(id, role) {
-  const user = state.users.find((u) => u.id === id);
+  const user = findUserById(id);
   if (!user) return null;
   user.role = role;
-  save(state);
+  save();
   return user;
 }
 
 function updateUserStatus(id, status) {
-  const user = state.users.find((u) => u.id === id);
+  const user = findUserById(id);
   if (!user) return null;
+  if (status === "suspended" && user.status !== "suspended") revokeSessions(user);
   user.status = status;
-  save(state);
+  save();
   return user;
 }
 
@@ -123,42 +172,43 @@ function deleteUserAccount(id) {
   const before = state.users.length;
   state.users = state.users.filter((u) => u.id !== id);
   state.sources = state.sources.filter((s) => s.userId !== id);
-  save(state);
+  save();
   return state.users.length < before;
 }
 
 function listAllAuditLog(limit = 100) {
-  return (state.auditLog || [])
+  return state.auditLog
     .slice(-limit)
     .reverse()
     .map((entry) => {
-      const u = state.users.find((x) => x.id === entry.userId);
+      const u = findUserById(entry.userId);
       return { ...entry, username: u ? u.username : `User #${entry.userId}` };
     });
 }
 
 function updateUser(id, { username, email }) {
-  const user = state.users.find((u) => u.id === id);
+  const user = findUserById(id);
   if (!user) return null;
   if (username) user.username = username;
-  if (email) user.email = email;
-  save(state);
+  if (email) user.email = email.toLowerCase();
+  save();
   return user;
 }
 
+// Changing the password signs out every other session.
 function updateUserPassword(id, passwordHash) {
-  const user = state.users.find((u) => u.id === id);
+  const user = findUserById(id);
   if (!user) return null;
   user.passwordHash = passwordHash;
-  save(state);
+  revokeSessions(user);
+  save();
   return user;
 }
 
 // ---- audit log ----
 function addAuditLog({ userId, action, detail }) {
-  if (!state.auditLog) state.auditLog = [];
   const entry = {
-    id: nextId(state.auditLog),
+    id: nextId("auditLog"),
     userId,
     action,
     detail,
@@ -166,12 +216,12 @@ function addAuditLog({ userId, action, detail }) {
   };
   state.auditLog.push(entry);
   if (state.auditLog.length > 500) state.auditLog = state.auditLog.slice(-500);
-  save(state);
+  save();
   return entry;
 }
 
 function listAuditLog(userId, limit = 20) {
-  return (state.auditLog || [])
+  return state.auditLog
     .filter((e) => e.userId === userId)
     .slice(-limit)
     .reverse();
@@ -195,9 +245,17 @@ function listSources(userId) {
   return state.sources.filter((s) => s.userId === userId);
 }
 
+function findSourceByIp(ip) {
+  return state.sources.find((s) => s.ip === ip);
+}
+
+function isRegisteredIp(ip) {
+  return state.sources.some((s) => s.ip === ip);
+}
+
 function createSource(userId, { name, ip, port, protocol }) {
   const source = {
-    id: nextId(state.sources),
+    id: nextId("sources"),
     userId,
     name,
     ip,
@@ -208,19 +266,19 @@ function createSource(userId, { name, ip, port, protocol }) {
     createdAt: new Date().toISOString(),
   };
   state.sources.push(source);
-  save(state);
+  save();
   return source;
 }
 
 function deleteSource(userId, sourceId) {
   const before = state.sources.length;
   state.sources = state.sources.filter((s) => !(s.id === sourceId && s.userId === userId));
-  save(state);
+  save();
   return state.sources.length < before;
 }
 
-// Called by the ingest listener whenever a datagram arrives, so the
-// Settings page can show "last seen" / active status per source.
+// Called by the ingest listener whenever a line arrives, so the Settings
+// page can show "last seen" / active status per source.
 function markSourceSeen(ip) {
   const matches = state.sources.filter((s) => s.ip === ip);
   if (!matches.length) return [];
@@ -229,27 +287,27 @@ function markSourceSeen(ip) {
     s.status = "active";
     s.lastSeen = now;
   });
-  save(state);
+  saveSoon();
   return matches;
 }
 
 // ---- logs & alerts ----
 function addLog({ sourceIp, message }) {
   const entry = {
-    id: nextId(state.logs),
+    id: nextId("logs"),
     sourceIp,
     message,
     createdAt: new Date().toISOString(),
   };
   state.logs.push(entry);
   if (state.logs.length > 2000) state.logs = state.logs.slice(-2000);
-  save(state);
+  saveSoon();
   return entry;
 }
 
 function addAlert({ sourceIp, severity, type, message }) {
   const alert = {
-    id: nextId(state.alerts),
+    id: nextId("alerts"),
     sourceIp,
     severity,
     type,
@@ -259,7 +317,7 @@ function addAlert({ sourceIp, severity, type, message }) {
   };
   state.alerts.push(alert);
   if (state.alerts.length > 1000) state.alerts = state.alerts.slice(-1000);
-  save(state);
+  saveSoon();
   return alert;
 }
 
@@ -275,7 +333,7 @@ function updateAlertStatus(id, status, ips = null) {
   const alert = inScope(state.alerts, ips).find((a) => a.id === id);
   if (!alert) return null;
   alert.status = status;
-  save(state);
+  save();
   return alert;
 }
 
@@ -321,6 +379,7 @@ function getStats(ips = null) {
 }
 
 export {
+  flush,
   findUserByEmail,
   findUserById,
   createUser,
@@ -337,6 +396,8 @@ export {
   addAuditLog,
   listAuditLog,
   listSources,
+  findSourceByIp,
+  isRegisteredIp,
   createSource,
   deleteSource,
   visibleIpsFor,

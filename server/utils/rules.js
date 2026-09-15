@@ -30,6 +30,16 @@ function recordAndCount(sourceIp, ruleType) {
   return timestamps.length;
 }
 
+// Forget IP/rule pairs that have gone quiet, so this map can't grow forever.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, timestamps] of recentMatches) {
+    if (!timestamps.length || now - timestamps[timestamps.length - 1] >= CORRELATION_WINDOW_MS) {
+      recentMatches.delete(key);
+    }
+  }
+}, CORRELATION_WINDOW_MS).unref();
+
 // Returns { severity, type } if the message should be raised as an alert,
 // or null if it should just be stored as a plain log line.
 function classify(message, sourceIp) {

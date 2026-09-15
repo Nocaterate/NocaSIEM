@@ -8,7 +8,8 @@
     "dev": "node --watch-path=server server/server.js --dev",
     "build": "vite build",
     "start": "node server/server.js",
-    "lint": "oxlint"
+    "lint": "oxlint",
+    "test-log": "node scripts/send-test-log.js"
   },
   "engines": {
     "node": ">=20.19"

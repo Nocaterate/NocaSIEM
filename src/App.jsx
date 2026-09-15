@@ -529,7 +529,10 @@ function SettingsView({ T, ingest, sources, sourceForm, setSourceForm, onAdd, on
     setTestingId(null);
   }
 
-  const host = window.location.hostname;
+  // When the dashboard is opened on the server itself the hostname is
+  // "localhost", which other devices on the network can't use.
+  const isLocal = ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname);
+  const host = isLocal ? "<this PC's IP>" : window.location.hostname;
 
   return (
     <div className="px-5 sm:px-8 py-8 max-w-[760px] mx-auto flex flex-col gap-6">
@@ -537,6 +540,7 @@ function SettingsView({ T, ingest, sources, sourceForm, setSourceForm, onAdd, on
         <span className="text-sm font-semibold" style={{ color: T.ink }}>Where to send logs</span>
         <p className="text-xs" style={{ color: T.slate }}>
           Configure each device's syslog forwarder to send to this server. Incoming traffic is matched to your sources by the device's IP address.
+          {isLocal && " You're viewing this on the server itself, so give devices this PC's network IP: run ipconfig and use the IPv4 Address (e.g. 192.168.1.20)."}
         </p>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
           {[

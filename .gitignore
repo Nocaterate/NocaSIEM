@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.log
+
+# editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+
+# secrets and runtime data - never commit these
+.env
+.env.*
+!.env.example
+data.json
+data.json.tmp
